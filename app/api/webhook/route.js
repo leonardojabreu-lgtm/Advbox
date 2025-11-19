@@ -1,26 +1,6 @@
-// app/api/webhook/route.js
+const VERIFY_TOKEN = "leonardo123"; // mesmo token configurado na Meta
 
-// 🔐 Mesmo token configurado na Meta (Configuração → Webhook)
-const VERIFY_TOKEN = "leonardo123";
-
-// 🧠 “Banco de dados” simples em memória (enquanto o servidor estiver vivo)
-const sessions = {};
-
-/*
-  Estrutura da sessão:
-  sessions[phone] = {
-    stage: 'intro' | 'ask_type' | 'collect_utility' | 'collect_bank' | 'summary' | 'docs' | 'handoff',
-    caseType: 'utility' | 'bank' | 'other' | null,
-    messages: [{ from: 'client'|'carolina', text: string, ts: number }],
-    createdAt: number,
-    lastUpdated: number,
-    questionsAsked: number
-  }
-*/
-
-// -----------------------------------------------------
-// ✅ GET – validação do Webhook (Meta)
-// -----------------------------------------------------
+// ========== 1) VERIFICAÇÃO DO WEBHOOK (GET) ==========
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get("hub.mode");
@@ -34,312 +14,204 @@ export async function GET(req) {
   return new Response("Token inválido", { status: 403 });
 }
 
-// -----------------------------------------------------
-// ✅ POST – recebe mensagens do WhatsApp
-// -----------------------------------------------------
+// ========== 2) RECEBIMENTO DE MENSAGENS (POST) ==========
 export async function POST(req) {
   const body = await req.json();
   console.log("POST webhook:", JSON.stringify(body, null, 2));
 
   try {
     const entry = body.entry?.[0];
-    const msg = entry?.changes?.[0]?.value?.messages?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const messages = value?.messages;
 
-    // Se não for mensagem de texto, ignora educadamente
-    if (!msg || msg.type !== "text") {
+    // Se não tiver mensagem, só confirma pra Meta
+    if (!messages || messages.length === 0) {
       return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
-    const from = msg.from;                // número do cliente (5521...)
-    const userText = msg.text.body.trim();
+    const message = messages[0];
+
+    // Por enquanto só tratamos texto
+    if (message.type !== "text") {
+      console.log("Mensagem não é de texto, ignorando.");
+      return new Response("EVENT_RECEIVED", { status: 200 });
+    }
+
+    const from = message.from;                 // número do cliente (ex: 5521...)
+    const userText = message.text?.body || ""; // texto enviado pelo cliente
 
     const token = process.env.WPP_TOKEN;
     const phoneNumberId = process.env.WPP_PHONE_ID;
     const openaiKey = process.env.OPENAI_API_KEY;
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const supabaseKey = process.env.SUPABASE_ANON_KEY;
 
     if (!token || !phoneNumberId) {
-      console.error("Faltando WPP_TOKEN ou WPP_PHONE_ID nas variáveis de ambiente.");
+      console.error("Faltando WPP_TOKEN ou WPP_PHONE_ID nas variáveis de ambiente");
       return new Response("Missing WhatsApp env vars", { status: 500 });
     }
 
-    // Recupera ou cria sessão
-    const session = getOrCreateSession(from);
-
-    // Atualiza histórico com a mensagem do cliente
-    session.messages.push({
-      from: "client",
-      text: userText,
-      ts: Date.now(),
-    });
-    session.lastUpdated = Date.now();
-
-    // Detecta/ajusta tipo de caso (apenas heurística)
-    if (!session.caseType) {
-      session.caseType = inferCaseType(userText);
-      if (session.caseType === "utility" && session.stage === "ask_type") {
-        session.stage = "collect_utility";
-      }
-      if (session.caseType === "bank" && session.stage === "ask_type") {
-        session.stage = "collect_bank";
-      }
+    if (!openaiKey) {
+      console.error("Faltando OPENAI_API_KEY nas variáveis de ambiente");
+      await enviarMensagemWhatsApp(
+        phoneNumberId,
+        token,
+        from,
+        "No momento não consigo acessar a IA, mas já recebi sua mensagem e vou retornar em breve."
+      );
+      return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
-    // Gera resposta da Carolina com base no estágio
-    const reply = openaiKey
-      ? await gerarRespostaCarolina(openaiKey, session, userText)
-      : fallbackSemOpenAI(session, userText);
+    if (!supabaseUrl || !supabaseKey) {
+      console.error("Faltando SUPABASE_URL ou SUPABASE_ANON_KEY");
+      await enviarMensagemWhatsApp(
+        phoneNumberId,
+        token,
+        from,
+        "Recebi sua mensagem, mas estou com uma instabilidade interna aqui. Já já te retorno!"
+      );
+      return new Response("EVENT_RECEIVED", { status: 200 });
+    }
 
-    // Atualiza estágio (máquina de estados simples)
-    avançarEstagio(session);
+    // ========== 2.1) BUSCA HISTÓRICO DO CLIENTE NO SUPABASE ==========
+    const history = await buscarHistoricoCliente(supabaseUrl, supabaseKey, from);
 
-    // Salva resposta no histórico
-    session.messages.push({
-      from: "carolina",
-      text: reply,
-      ts: Date.now(),
-    });
+    // Se já passou de X mensagens, em vez de ficar eternamente conversando,
+    // a Carolina encerra e manda pro advogado
+    if (history.length >= 18) {
+      const encerramento =
+        "Perfeito, já tenho bastante informação sobre o seu caso aqui.\n" +
+        "Agora vou repassar tudo para o advogado responsável do escritório analisar com calma, " +
+        "e assim que ele verificar, alguém da equipe te responde aqui com a orientação certinha, tudo bem?";
 
-    // Envia resposta via WhatsApp
-    await enviarMensagemWhatsApp(phoneNumberId, token, from, reply);
+      await salvarMensagem(supabaseUrl, supabaseKey, from, "assistant", encerramento);
+      await enviarMensagemWhatsApp(phoneNumberId, token, from, encerramento);
+
+      return new Response("EVENT_RECEIVED", { status: 200 });
+    }
+
+    // ========== 2.2) MONTA CONTEXTO (SYSTEM + MEMÓRIA + MENSAGEM ATUAL) ==========
+    const systemPrompt = buildSystemPrompt();
+
+    const mensagensPassadas = history
+      .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+      .map((m) => ({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: m.content,
+      }));
+
+    const messagesForGPT = [
+      { role: "system", content: systemPrompt },
+      ...mensagensPassadas,
+      { role: "user", content: `Mensagem do cliente (${from}): ${userText}` },
+    ];
+
+    // ========== 2.3) CHAMA GPT-4o ==========
+    const gptAnswer = await gerarRespostaComGPT(openaiKey, messagesForGPT);
+
+    const finalText =
+      gptAnswer ||
+      "Recebi sua mensagem e já vou analisar com calma. Caso seja algo urgente, me conta se há prazo ou audiência próxima.";
+
+    // ========== 2.4) SALVA NO SUPABASE (MEMÓRIA) ==========
+    await salvarMensagem(supabaseUrl, supabaseKey, from, "user", userText);
+    await salvarMensagem(supabaseUrl, supabaseKey, from, "assistant", finalText);
+
+    // ========== 2.5) RESPONDE PELO WHATSAPP ==========
+    await enviarMensagemWhatsApp(phoneNumberId, token, from, finalText);
   } catch (err) {
     console.error("Erro ao processar webhook:", err);
   }
 
-  // A Meta sempre precisa de 200
+  // Sempre responder 200 para a Meta
   return new Response("EVENT_RECEIVED", { status: 200 });
 }
 
-// -----------------------------------------------------
-// 🧩 Sessão por cliente
-// -----------------------------------------------------
-function getOrCreateSession(phone) {
-  if (!sessions[phone]) {
-    sessions[phone] = {
-      stage: "intro",
-      caseType: null,
-      messages: [],
-      createdAt: Date.now(),
-      lastUpdated: Date.now(),
-      questionsAsked: 0,
-    };
+// ========== 3) FUNÇÃO GPT-4o ==========
+async function gerarRespostaComGPT(openaiKey, messages) {
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${openaiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages,
+        max_tokens: 500,
+        temperature: 0.4,
+      }),
+    });
+
+    const data = await response.json();
+    console.log("Resposta da OpenAI:", JSON.stringify(data, null, 2));
+
+    const content = data?.choices?.[0]?.message?.content;
+    return content;
+  } catch (err) {
+    console.error("Erro ao chamar OpenAI:", err);
+    return null;
   }
-  return sessions[phone];
 }
 
-// Heurística simples pra adivinhar tipo de caso
-function inferCaseType(text) {
-  const t = text.toLowerCase();
+// ========== 4) SUPABASE – BUSCAR HISTÓRICO ==========
+async function buscarHistoricoCliente(supabaseUrl, supabaseKey, userId) {
+  try {
+    const url = `${supabaseUrl}/rest/v1/messages_memory?user_id=eq.${userId}&order=created_at.desc&limit=20`;
 
-  if (
-    t.includes("água") ||
-    t.includes("aguá") ||
-    t.includes("luz") ||
-    t.includes("energia") ||
-    t.includes("internet") ||
-    t.includes("telefone") ||
-    t.includes("enel") ||
-    t.includes("light") ||
-    t.includes("claro") ||
-    t.includes("vivo") ||
-    t.includes("tim")
-  ) {
-    return "utility";
-  }
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        Accept: "application/json",
+      },
+    });
 
-  if (
-    t.includes("banco") ||
-    t.includes("cartão") ||
-    t.includes("cartao") ||
-    t.includes("crédito") ||
-    t.includes("credito") ||
-    t.includes("débito") ||
-    t.includes("debito") ||
-    t.includes("serasa") ||
-    t.includes("spc") ||
-    t.includes("limite") ||
-    t.includes("negativ")
-  ) {
-    return "bank";
-  }
-
-  return "other";
-}
-
-// Avança o estágio da conversa
-function avançarEstagio(session) {
-  const { stage, caseType } = session;
-  session.questionsAsked++;
-
-  if (stage === "intro") {
-    session.stage = "ask_type";
-    return;
-  }
-
-  if (stage === "ask_type") {
-    if (caseType === "utility") {
-      session.stage = "collect_utility";
-    } else if (caseType === "bank") {
-      session.stage = "collect_bank";
+    if (!resp.ok) {
+      console.error("Erro ao buscar histórico no Supabase:", await resp.text());
+      return [];
     }
-    return;
-  }
 
-  // Depois de algumas interações, parte pra resumo/documentos/encerramento
-  if (stage === "collect_utility" || stage === "collect_bank") {
-    if (session.questionsAsked >= 4) {
-      session.stage = "summary";
-      return;
+    const data = await resp.json();
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    console.error("Erro buscarHistoricoCliente:", err);
+    return [];
+  }
+}
+
+// ========== 5) SUPABASE – SALVAR MENSAGEM ==========
+async function salvarMensagem(supabaseUrl, supabaseKey, userId, role, content) {
+  try {
+    const url = `${supabaseUrl}/rest/v1/messages_memory`;
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        role,
+        content,
+      }),
+    });
+
+    if (!resp.ok) {
+      console.error("Erro ao salvar mensagem no Supabase:", await resp.text());
     }
+  } catch (err) {
+    console.error("Erro salvarMensagem:", err);
   }
-
-  if (stage === "summary") {
-    session.stage = "docs";
-    return;
-  }
-
-  if (stage === "docs") {
-    session.stage = "handoff";
-    return;
-  }
-
-  // handoff: mantém aqui (não reinicia)
 }
 
-// -----------------------------------------------------
-// 🧠 Carolina + GPT-4o-mini
-// -----------------------------------------------------
-async function gerarRespostaCarolina(openaiKey, session, userText) {
-  const { stage, caseType, messages } = session;
-
-  const historicoCliente = messages
-    .filter(m => m.from === "client")
-    .map(m => `Cliente: ${m.text}`)
-    .join("\n");
-
-  const historicoCarolina = messages
-    .filter(m => m.from === "carolina")
-    .map(m => `Carolina: ${m.text}`)
-    .join("\n");
-
-  const systemPrompt = `
-Você é CAROLINA, secretária virtual de um escritório de advocacia em Niterói/RJ.
-Especialidades: problemas com água, luz, internet/telefone, bancos e fintechs.
-Seu papel é APENAS atendimento inicial, sem opinião jurídica, sem falar em valores de causa.
-
-NUNCA use linguagem jurídica técnica.
-NUNCA fale em artigo de lei, jurisprudência ou valores de indenização.
-NUNCA diga que o cliente "tem direito" ou que "vai ganhar". Diga sempre que quem avalia é o advogado.
-
-ETAPAS DA CONVERSA (stage atual: ${stage}, tipo de caso: ${caseType || "indefinido"}):
-
-1) "intro"
-   - Somente se stage === "intro".
-   - Apresente-se uma única vez:
-     "Olá, tudo bem? 😊
-      Eu sou a Carolina! Nosso escritório é especializado em problemas com água, luz, internet e questões com bancos/fintechs.
-      Somos da cidade de Niterói e atendemos em todo o estado do Rio de Janeiro.
-      Vou te fazer algumas perguntas rápidas pra entender o que aconteceu e organizar tudo pro advogado responsável analisar o seu caso, combinado?"
-   - NÃO repita essa apresentação nos demais estágios.
-
-2) "ask_type"
-   - Pergunte de forma direta:
-   - "Pra eu te ajudar direitinho: o seu problema é com água, luz, internet/telefone, banco/fintech ou outro tipo de situação?"
-
-3) "collect_utility" (casos de água/luz/internet/telefone)
-   - Faça perguntas EM BLOCO, numeradas, sem repetir o texto anterior:
-     1️⃣ Nome completo e bairro/cidade.
-     2️⃣ Há quanto tempo ficaram/estão sem o serviço ou com problema?
-     3️⃣ Na casa mora criança, idoso ou alguém doente?
-     4️⃣ Tem protocolos de atendimento da empresa? Peça os números.
-     5️⃣ Pergunte sobre prejuízos diretos (perda de alimentos, não conseguir trabalhar, medicamentos etc.).
-   - Se o cliente já respondeu algo, NÃO repita a mesma pergunta; complemente com o que faltar.
-
-4) "collect_bank" (casos de banco/fintech)
-   - Faça perguntas EM BLOCO, numeradas:
-     1️⃣ Nome completo e bairro/cidade.
-     2️⃣ Com qual banco ou fintech é o problema?
-     3️⃣ O problema é negativação indevida, débito não reconhecido, redução de limite ou outro?
-     4️⃣ Desde quando isso está acontecendo?
-     5️⃣ Se já tentou resolver direto com o banco. Peça protocolos.
-     6️⃣ Pergunte sobre prejuízo direto (compra negada, constrangimento, nome sujo etc.).
-   - Não repita perguntas que já foram claramente respondidas.
-
-5) "summary"
-   - Faça um RESUMO organizado do caso com base no que o cliente já contou.
-   - Exemplo:
-     "Entendi, [nome]. Você ficou X dias sem [serviço], em [bairro/cidade], teve [situação especial] e [prejuízos]."
-   - Diga que vai organizar tudo pro advogado responsável analisar.
-
-6) "docs"
-   - Peça documentos, sempre em tom prático:
-     ✔ Foto de documento com foto (RG ou CNH).
-     ✔ Foto de conta recente do serviço ou banco.
-     ✔ Fotos ou vídeos que mostrem o problema, se tiver.
-   - Explique que isso ajuda o advogado a avaliar melhor.
-
-7) "handoff"
-   - Agradeça, diga que as informações já foram organizadas e que o advogado ou alguém da equipe vai analisar e responder ali mesmo no WhatsApp.
-   - Se o cliente insistir em valores, chances de ganhar etc., repita de forma educada que essa avaliação é exclusiva do advogado.
-
-REGRAS IMPORTANTES:
-- Se stage NÃO for "intro", NÃO repita a apresentação completa.
-- Nunca mande respostas enormes demais; seja clara e objetiva, mas acolhedora.
-- Pode usar emojis com moderação (😊, 🙏, ✅, etc.).
-- Se a mensagem do cliente não tiver relação com problema jurídico, responda com cuidado e tente trazer de volta para o contexto de atendimento jurídico.
-
-HISTÓRICO (útil para não repetir coisas):
-${historicoCliente ? historicoCliente : "(ainda sem histórico do cliente)"}
-
-RESPOSTAS ANTERIORES DA CAROLINA:
-${historicoCarolina || "(nenhuma resposta enviada ainda)"}
-`;
-
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${openaiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userText },
-      ],
-      max_tokens: 450,
-      temperature: 0.35,
-    }),
-  });
-
-  const data = await response.json();
-  console.log("Resposta OpenAI:", JSON.stringify(data, null, 2));
-
-  const content = data?.choices?.[0]?.message?.content;
-  return (
-    content ||
-    "Certo, entendi. Pode me contar um pouco mais do que aconteceu, por favor?"
-  );
-}
-
-// Fallback se faltar chave da OpenAI
-function fallbackSemOpenAI(session, userText) {
-  if (session.stage === "intro") {
-    return (
-      "Olá, tudo bem? 😊 Eu sou a Carolina, do escritório. " +
-      "No momento estou sem acesso ao sistema de IA, mas já recebi sua mensagem. " +
-      "Você pode me dizer se o problema é com água, luz, internet/telefone, banco/fintech ou outro tipo de situação?"
-    );
-  }
-
-  return (
-    "Recebi a sua mensagem e vou organizar tudo aqui pro advogado responsável analisar, " +
-    "tudo bem? Se puder, me conte com detalhes o que aconteceu."
-  );
-}
-
-// -----------------------------------------------------
-// 📤 Envio de mensagem via API oficial do WhatsApp
-// -----------------------------------------------------
+// ========== 6) ENVIAR MENSAGEM PELO WHATSAPP ==========
 async function enviarMensagemWhatsApp(phoneNumberId, token, to, text) {
   const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
 
@@ -363,4 +235,100 @@ async function enviarMensagemWhatsApp(phoneNumberId, token, to, text) {
   if (!resp.ok) {
     console.error("Erro ao enviar mensagem pelo WhatsApp:", data);
   }
+}
+
+// ========== 7) PROMPT DA CAROLINA (SYSTEM) ==========
+function buildSystemPrompt() {
+  return `
+Você é a CAROLINA, secretária virtual de um escritório de advocacia especializado em:
+
+- Problemas com serviços essenciais (água, luz, internet/telefone)
+- Problemas com bancos (negativação indevida, débitos não reconhecidos, redução de limite etc.)
+
+O escritório atua principalmente em Niterói/RJ e região e possui um ADVOGADO RESPONSÁVEL TÉCNICO regularmente inscrito na OAB/RJ sob o nº 188.795.
+
+SEU PAPEL:
+- Fazer o PRIMEIRO ATENDIMENTO dos contatos que chegam pelo WhatsApp ou chat.
+- Gerar CONFIANÇA rápida, mostrando que é um escritório real e organizado.
+- Coletar TODAS as informações essenciais do caso.
+- Explicar, de forma simples, como funciona o atendimento do escritório.
+- Preparar um RESUMO organizado do caso para o advogado responsável e sua equipe.
+- Nunca dar opinião jurídica, nunca prometer resultado e nunca falar como se fosse o advogado.
+
+COMO SE APRESENTAR:
+Sempre inicie de forma parecida com:
+
+“Olá, tudo bem? 😊
+Eu sou a Carolina! Nosso escritório é especializado em problemas com água, luz, internet e questões com bancos. Somos da cidade de Niterói e atendemos em todo estado do Rio de Janeiro.
+Vou te fazer algumas perguntas rápidas pra entender o que aconteceu e organizar tudo pro advogado responsável analisar o seu caso, combinado?”
+
+Se perguntarem “quem é o advogado?”, responda:
+
+“O escritório conta com o advogado responsável Tiago Barbosa Bastos, inscrito na OAB/RJ sob o nº 188.795, além de uma equipe de apoio que cuida do atendimento e acompanhamento dos casos.”
+
+TOM E POSTURA:
+- Educada, acolhedora e objetiva.
+- Linguagem simples, sem juridiquês.
+- Não inventar informações.
+- Nunca falar em artigo de lei, jurisprudência ou valores de indenização.
+- Sempre reforçar que quem analisa o caso é o advogado responsável.
+
+FLUXO PADRÃO – SERVIÇOS ESSENCIAIS:
+Quando identificar que é problema com água, luz, internet/telefone, pergunte em bloco:
+
+“Pra eu organizar certinho pro advogado responsável, me responde, por favor:
+1️⃣ Seu nome completo e bairro/cidade.
+2️⃣ O problema é com água, luz ou internet/telefone?
+3️⃣ Há quanto tempo vocês ficaram/estão sem o serviço?
+4️⃣ Na casa mora criança, idoso ou alguém doente?
+5️⃣ Você tem protocolos de atendimento da empresa? Se tiver, me manda os números.
+6️⃣ Você teve algum prejuízo direto (perda de alimentos, não conseguir trabalhar, remédios, etc.)?
+7️⃣ As contas estavam em dia nesse período?”
+
+FLUXO PADRÃO – BANCOS:
+Quando for banco, pergunte:
+
+“Pra eu organizar pro advogado responsável, me conta:
+1️⃣ Seu nome completo e bairro/cidade.
+2️⃣ É com qual banco?
+3️⃣ O problema é negativação indevida, débito não reconhecido, redução de limite ou outro?
+4️⃣ Desde quando isso está acontecendo?
+5️⃣ Você tentou resolver direto com o banco? Tem protocolos?
+6️⃣ Isso te causou algum prejuízo direto (compra negada, constrangimento, nome sujo, etc.)?”
+
+APÓS COLETAR AS RESPOSTAS:
+- Faça um pequeno resumo do caso usando o que o cliente contou.
+- Explique sempre:
+
+“Vou te explicar rapidinho como funciona o atendimento aqui no escritório:
+
+1️⃣ Eu organizo suas informações e passo pro advogado responsável analisar o caso.
+2️⃣ Após isso, o advogado responsável vai te pedir alguns documentos básicos (RG, CPF, comprovante de residência, contas, protocolos, fotos/vídeos).
+3️⃣ Depois o escritório envia contrato e procuração, tudo por escrito, pra você ler e assinar com calma.
+4️⃣ A partir daí, o escritório entra com a ação (se for o caso) e te informa o número do processo, além dos principais andamentos.
+
+Sempre que você tiver dúvida, pode perguntar aqui mesmo.”
+
+PEDIR DOCUMENTOS:
+Quando o caso parecer consistente, diga:
+
+“Pelo que você contou, o caso pode ser analisado com atenção, sim.
+
+Pra eu deixar tudo pronto pro advogado responsável, você consegue me enviar:
+✔ Uma foto nítida de um documento com foto (RG ou CNH)
+✔ Uma foto de uma conta recente do serviço ou do banco
+✔ E, se tiver, fotos ou vídeos que mostrem a situação
+
+Assim ele consegue avaliar melhor e te dar um retorno mais preciso.”
+
+LIMITES:
+- Se o cliente perguntar se ‘tem direito’, ‘vai ganhar’ ou ‘quanto vai receber’, responda que quem faz essa avaliação é o advogado responsável depois de analisar os documentos.
+- Nunca prometa resultado.
+
+ENDEREÇO DO ESCRITÓRIO:
+- Rua General Andrade Neves, número 9, sala 911 - Centro de Niterói/RJ.
+
+OBJETIVO FINAL:
+Gerar confiança, organizar o caso e deixar o lead pronto para o advogado decidir se segue ou não com a ação.
+`;
 }
