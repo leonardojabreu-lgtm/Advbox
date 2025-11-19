@@ -1,34 +1,64 @@
-const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
-
-/**
- * Gera uma análise jurídica estruturada a partir do histórico do cliente
- * @param {string} openaiKey - OPENAI_API_KEY
- * @param {string} phone - número do cliente (ex: 5521...)
- * @param {Array} history - histórico vindo do Supabase (messages_memory)
- */
 export async function runLegalAnalysis(openaiKey, phone, history) {
   try {
-    if (!openaiKey) {
-      console.warn("runLegalAnalysis: OPENAI_API_KEY ausente, ignorando análise.");
-      return null;
-    }
+    const messages = [
+      {
+        role: "system",
+        content: `
+Você é um AGENTE JURÍDICO. Sua função é ler todo o histórico de mensagens entre o cliente e a secretária Carolina e ORGANIZAR as informações objetivas abaixo.
 
-    if (!history || history.length === 0) {
-      console.warn("runLegalAnalysis: histórico vazio, nada para analisar.");
-      return null;
-    }
+IMPORTANTE:
+- NÃO invente dados.
+- Se algum dado não estiver claro, deixe como null.
+- NÃO escreva mensagens longas.
+- SUA RESPOSTA DEVE SER EM JSON PURO.
 
-    // Monta um texto contínuo com a conversa
-    const conversa = history
-      .map((m) => {
-        const quem = m.role === "assistant" ? "CAROLINA" : "CLIENTE";
-        return `${quem}: ${m.content}`;
+ESTRUTURA DO JSON FINAL:
+
+{
+ "nome": "...",
+ "bairro": "...",
+ "cidade": "...",
+ "tipo_problema": "...",
+ "empresa": "...",
+ "dias_sem_servico": "...",
+ "conta_em_dia": "...",
+ "protocolos": ["...", "..."],
+ "prejuizos": "...",
+ "resumo_inicial": "TEXTO PRONTO PARA A INICIAL"
+}
+
+Agora leia o histórico e extraia essas informações.
+        `
+      },
+      ...history.map(h => ({
+        role: h.role === "assistant" ? "assistant" : "user",
+        content: h.content
+      }))
+    ];
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${openaiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages,
+        temperature: 0.2,
+        max_tokens: 900
       })
-      .join("\n");
+    });
 
-    const systemPrompt = `
-Você é um ASSISTENTE JURÍDICO INTERNO de um escritório de advocacia.
-Você NÃO fala com o cliente. Você só lê o histórico da conversa entre a secretária CAROLINA e o CLIENTE
-e gera um resumo organizado do caso para uso interno.
+    const data = await response.json();
+    const jsonText = data?.choices?.[0]?.message?.content;
 
-Retorne SEMPRE e SOMENTE um JSON VÁLIDO (sem texto fora do JSON) com a seguinte
+    if (!jsonText) return null;
+
+    return JSON.parse(jsonText);
+
+  } catch (err) {
+    console.error("Erro no agente jurídico:", err);
+    return null;
+  }
+}
