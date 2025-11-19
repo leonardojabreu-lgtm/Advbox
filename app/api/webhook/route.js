@@ -41,8 +41,8 @@ export async function POST(req) {
       return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
-    const from = message.from;                 // número do cliente (ex: 5521...)
-    const userText = message.text?.body || ""; // texto enviado pelo cliente
+    const from = message.from; // número do cliente (ex: 5521...)
+    const userText = message.text?.body || "";
 
     const wppToken = process.env.WPP_TOKEN;
     const phoneNumberId = process.env.WPP_PHONE_ID;
@@ -106,7 +106,6 @@ export async function POST(req) {
     const ultimaResposta = history.filter((h) => h.role === "assistant").at(-1);
     if (ultimaResposta && ultimaResposta.content?.trim() === finalText.trim()) {
       console.log("Resposta seria igual à anterior, ajustando texto para evitar repetição.");
-      // pequeno ajuste
       const ajustada =
         finalText +
         "\n\n(Atualizei aqui pra não te mandar a mesma mensagem duas vezes seguidas 😊)";
@@ -121,8 +120,7 @@ export async function POST(req) {
     await saveMessage(from, "assistant", finalText);
 
     // ========== 2.6) DISPARA ANÁLISE JURÍDICA + CRM (ASSÍNCRONO) ==========
-    // Não precisamos travar a resposta do cliente nisso, então rodamos em "background"
-    ;(async () => {
+    (async () => {
       try {
         const fullHistory = await getHistory(from);
         const analysis = await runLegalAnalysis(openaiKey, from, fullHistory);
@@ -143,7 +141,7 @@ export async function POST(req) {
   return new Response("EVENT_RECEIVED", { status: 200 });
 }
 
-// ========== 3) CHAMADA GENÉRICA AO GPT-4o ==========
+// ========== 3) CHAMADA AO GPT-4o ==========
 async function callOpenAIChat(openaiKey, messages) {
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
