@@ -1,57 +1,36 @@
-import { resumirHistoricoSimples } from "./utils/formatters";
+import { callOpenAIForAnalysis } from "./legalOpenAiHelper"; // opcional, mas pra simplificar vamos direto no fetch abaixo
 
-export async function runLegalAnalysis(openaiKey, userNumber, history) {
+export async function runLegalAnalysis(openaiKey, userId, history) {
   try {
-    if (!openaiKey || !history || history.length === 0) return null;
-
-    const resumo = resumirHistoricoSimples(history);
+    const mensagensCliente = history
+      .filter((m) => m.role !== "assistant")
+      .map((m) => m.content)
+      .join("\n---\n");
 
     const systemPrompt = `
-Você é um ASSISTENTE JURÍDICO INTERNO de um escritório de advocacia que atua com:
+Você é um assistente jurídico interno (NÃO fala com o cliente).
+Sua função é ler o histórico de conversa entre a secretária CAROLINA e o cliente e gerar um resumo estruturado do caso, APENAS para uso interno do escritório.
 
-- Falta ou falha de serviços essenciais (água, luz, internet/telefone)
-- Problemas com bancos (negativação indevida, débitos não reconhecidos, redução de limite etc.)
-
-Sua função é APENAS organizar o caso para uso interno do escritório, em FORMATO ESTRUTURADO.
-
-NUNCA fale com o cliente diretamente.
-NUNCA dê opinião sobre probabilidade de êxito.
-NUNCA cite artigos de lei, jurisprudência ou valores.
-
-Retorne SEMPRE em JSON válido, com este formato:
+Retorne SEMPRE um JSON válido com os campos:
 
 {
-  "tipoCaso": "servico_essencial" | "banco" | "duvida_geral" | "outro",
-  "subtipo": "agua" | "luz" | "internet" | "telefone" | "limite" | "negativacao" | "debito" | "outro",
-  "nomeProvavel": "string ou vazio",
-  "cidadeBairroProvavel": "string ou vazio",
-  "empresaEnvolvida": "string ou vazio",
-  "diasSemServicoOuProblemaDesde": "string curta",
-  "temCriancaIdosoDoenteEmCasa": true/false/null,
-  "haPrejuizoDireto": true/false/null,
-  "descricaoPrejuizos": "string curta",
-  "temProtocolos": true/false/null,
-  "listaProtocolos": ["...", "..."],
-  "urgencia": "alta" | "media" | "baixa",
-  "acoesInternasSugeridas": [
-    "string 1",
-    "string 2"
-  ],
-  "observacoesInternas": "texto curto para equipe interna"
+  "nome": string | null,
+  "cidade_bairro": string | null,
+  "tipo_problema": "agua" | "luz" | "internet" | "telefone" | "banco" | "outro" | null,
+  "empresa": string | null,
+  "dias_sem_servico": string | null,
+  "ha_idoso_ou_crianca": boolean | null,
+  "prejuizos": string | null,
+  "protocolos": string[] | [],
+  "contas_em_dia": boolean | null,
+  "parece_caso_relevante": boolean,
+  "observacoes": string
 }
 
-Não escreva nada fora do JSON.
+Não inclua comentários fora do JSON.
 `;
 
-    const messages = [
-      { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: `Histórico de conversa com o cliente (número ${userNumber}):\n${resumo}`,
-      },
-    ];
-
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiKey}`,
@@ -59,35 +38,32 @@ Não escreva nada fora do JSON.
       },
       body: JSON.stringify({
         model: "gpt-4o",
-        messages,
-        max_tokens: 400,
-        temperature: 0.2,
+        messages: [
+          { role: "system", content: systemPrompt },
+          {
+            role: "user",
+            content: `Histórico de mensagens do cliente ${userId}:\n\n${mensagensCliente}`,
+          },
+        ],
+        max_tokens: 600,
+        temperature: 0.1,
       }),
     });
 
-    const data = await resp.json();
-    console.log("Resposta OpenAI (LegalAgent):", JSON.stringify(data, null, 2));
+    const data = await response.json();
+    const raw = data?.choices?.[0]?.message?.content || "{}";
 
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) return null;
-
-    // tenta parsear JSON
+    let parsed;
     try {
-      const jsonStart = content.indexOf("{");
-      const jsonEnd = content.lastIndexOf("}");
-      const jsonStr =
-        jsonStart >= 0 && jsonEnd > jsonStart
-          ? content.slice(jsonStart, jsonEnd + 1)
-          : content;
-
-      const parsed = JSON.parse(jsonStr);
-      return parsed;
-    } catch (e) {
-      console.error("Erro ao parsear JSON do LegalAgent:", e, "content:", content);
+      parsed = JSON.parse(raw);
+    } catch {
+      console.error("Falha ao parsear JSON da análise jurídica:", raw);
       return null;
     }
+
+    return parsed;
   } catch (err) {
-    console.error("Erro runLegalAnalysis:", err);
+    console.error("Erro em runLegalAnalysis:", err);
     return null;
   }
 }
