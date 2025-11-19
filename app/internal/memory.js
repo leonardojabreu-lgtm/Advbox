@@ -1,70 +1,44 @@
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
+import { supabase } from "./supabaseClient";
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.warn(
-    "SUPABASE_URL ou SUPABASE_ANON_KEY não configurados. A memória por cliente não irá funcionar corretamente."
-  );
-}
+// Tabela: whatsapp_history
+// colunas: id (uuid), user_id (text), role (text), content (text), created_at (timestamp)
 
-// Busca últimas mensagens de um cliente
-export async function getHistory(userNumber, limit = 20) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return [];
+export async function getHistory(userId) {
+  if (!supabase) return [];
 
   try {
-    const url = `${SUPABASE_URL}/rest/v1/messages_memory?user_number=eq.${encodeURIComponent(
-      userNumber
-    )}&order=created_at.asc&limit=${limit}`;
+    const { data, error } = await supabase
+      .from("whatsapp_history")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true });
 
-    const resp = await fetch(url, {
-      method: "GET",
-      headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        Accept: "application/json",
-      },
-    });
-
-    if (!resp.ok) {
-      console.error("Erro ao buscar histórico no Supabase:", await resp.text());
+    if (error) {
+      console.error("Erro ao buscar histórico no Supabase:", error);
       return [];
     }
 
-    const data = await resp.json();
-    if (!Array.isArray(data)) return [];
-    return data;
+    return data || [];
   } catch (err) {
-    console.error("Erro getHistory:", err);
+    console.error("Erro inesperado ao buscar histórico:", err);
     return [];
   }
 }
 
-// Salva mensagem na memória
-export async function saveMessage(userNumber, role, content) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+export async function saveMessage(userId, role, content) {
+  if (!supabase) return;
 
   try {
-    const url = `${SUPABASE_URL}/rest/v1/messages_memory`;
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        "Content-Type": "application/json",
-        Prefer: "return=minimal",
-      },
-      body: JSON.stringify({
-        user_number: userNumber,
-        role,
-        content,
-      }),
+    const { error } = await supabase.from("whatsapp_history").insert({
+      user_id: userId,
+      role,
+      content,
     });
 
-    if (!resp.ok) {
-      console.error("Erro ao salvar mensagem no Supabase:", await resp.text());
+    if (error) {
+      console.error("Erro ao salvar mensagem no Supabase:", error);
     }
   } catch (err) {
-    console.error("Erro saveMessage:", err);
+    console.error("Erro inesperado ao salvar mensagem:", err);
   }
 }
