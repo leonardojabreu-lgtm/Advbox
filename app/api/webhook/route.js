@@ -1,108 +1,177 @@
-import { NextResponse } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { getHistory, saveMessage } from "../../internal/memory";
+import { buildSystemPrompt } from "../../internal/rules";
+import { runLegalAnalysis } from "../../internal/legalAgent";
+import { upsertLeadFromAnalysis } from "../../internal/crmConnector";
 
-// --- CONFIGURAÇÃO ---
-// Inicializa o Gemini com a sua API KEY
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+const VERIFY_TOKEN = "leonardo123";
 
-// IMPORTANTE: Usamos o 'gemini-1.5-flash' pois é mais rápido e evita o erro 404 do 'pro' antigo
-const model = genAI.getGenerativeModel({ 
-  model: "gemini-1.5-flash",
-  systemInstruction: "Você é um assistente útil e amigável no WhatsApp." // Opcional: define a personalidade
-});
-
-// --- FUNÇÃO GET (Verificação do Webhook pela Meta) ---
+// =======================
+// 1) GET - VERIFICAÇÃO META
+// =======================
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
-  
-  const mode = searchParams.get('hub.mode');
-  const token = searchParams.get('hub.verify_token');
-  const challenge = searchParams.get('hub.challenge');
 
-  // Verifica se o token bate com o que você definiu no .env
-  if (mode === 'subscribe' && token === process.env.WEBHOOK_VERIFY_TOKEN) {
-    console.log("Webhook verificado com sucesso!");
-    return new NextResponse(challenge, { status: 200 });
+  if (
+    searchParams.get("hub.mode") === "subscribe" &&
+    searchParams.get("hub.verify_token") === VERIFY_TOKEN
+  ) {
+    return new Response(searchParams.get("hub.challenge"), { status: 200 });
   }
 
-  return new NextResponse('Falha na verificação. Token inválido.', { status: 403 });
+  return new Response("Erro de verificação", { status: 403 });
 }
 
-// --- FUNÇÃO POST (Recebimento das Mensagens) ---
+// =======================
+// 2) POST - RECEBIMENTO WHATSAPP
+// =======================
 export async function POST(req) {
+  const body = await req.json();
+  console.log("Webhook recebido:", JSON.stringify(body, null, 2));
+
   try {
-    const body = await req.json();
-
-    // Log para debug na Vercel (ajuda a ver o que está chegando)
-    // console.log("Payload recebido:", JSON.stringify(body, null, 2));
-
-    // Navega no objeto JSON complexo do WhatsApp para achar a mensagem
     const entry = body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-    const messages = value?.messages;
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const msg = value?.messages?.[0];
 
-    // Se não houver mensagem (ex: status de leitura, digitando, etc), retornamos 200 para não travar
-    if (!messages || messages.length === 0) {
-      return new NextResponse('EVENT_RECEIVED', { status: 200 });
+    if (!msg || msg.type !== "text") {
+      return new Response("OK", { status: 200 });
     }
 
-    // Pega a primeira mensagem e o número de quem enviou
-    const message = messages[0];
-    const senderPhone = message.from; // Número do usuário (ex: 5511999999999)
-    const messageType = message.type;
+    const from = msg.from;
+    const text = msg.text?.body || "";
 
-    // Verifica se é uma mensagem de texto
-    if (messageType === 'text') {
-      const userText = message.text.body;
-      
-      console.log(`Mensagem de ${senderPhone}: ${userText}`);
+    const WPP_TOKEN = process.env.WPP_TOKEN;
+    const WPP_PHONE_ID = process.env.WPP_PHONE_ID;
+    const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
-      // 1. Gera a resposta com o Gemini
-      const chatResponse = await model.generateContent(userText);
-      const aiResponse = chatResponse.response.text();
-
-      // 2. Envia a resposta de volta para o WhatsApp
-      await sendWhatsAppMessage(senderPhone, aiResponse);
+    if (!OPENAI_KEY) {
+      await sendWpp(WPP_PHONE_ID, WPP_TOKEN, from,
+        "No momento não consigo acessar a IA, mas já recebi sua mensagem e vou retornar em breve."
+      );
+      return new Response("OK", { status: 200 });
     }
 
-    // Retorna 200 OK para o WhatsApp saber que recebemos (obrigatório)
-    return new NextResponse('EVENT_RECEIVED', { status: 200 });
+    // HISTÓRICO
+    const history = await getHistory(from);
 
-  } catch (error) {
-    console.error("Erro no processamento:", error);
-    // Mesmo com erro, é boa prática retornar 200 para o WhatsApp não ficar tentando reenviar o webhook infinitamente
-    return new NextResponse('Internal Server Error', { status: 200 });
+    if (history.length >= 30) {
+      const encerramento =
+        "Muito obrigado! Eu já tenho todas as informações importantes do seu caso. Agora vou repassar tudo para o advogado analisar com cuidado, e ele te responde aqui mesmo.";
+      await saveMessage(from, "assistant", encerramento);
+      await sendWpp(WPP_PHONE_ID, WPP_TOKEN, from, encerramento);
+      return new Response("OK", { status: 200 });
+    }
+
+    // SYSTEM CONTEXT
+    const systemPrompt = buildSystemPrompt();
+
+    // MENSAGENS
+    const pastMessages = history
+      .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+      .map((m) => ({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: m.content,
+      }));
+
+    const messagesForAI = [
+      { role: "system", content: systemPrompt },
+      ...pastMessages,
+      { role: "user", content: `Cliente (${from}): ${text}` },
+    ];
+
+    // GPT-4o
+    const resposta = await callOpenAIChat(OPENAI_KEY, messagesForAI);
+    const finalText =
+      resposta ||
+      "Recebi sua mensagem e já vou analisar para te ajudar da melhor forma possível.";
+
+    // EVITAR REPETIÇÃO
+    const lastBot = history.filter((m) => m.role === "assistant").at(-1);
+    if (lastBot && lastBot.content.trim() === finalText.trim()) {
+      const ajustada =
+        finalText +
+        "\n\n(Atualizei aqui só para não te mandar a mesma mensagem novamente 😊)";
+      await saveMessage(from, "assistant", ajustada);
+      await sendWpp(WPP_PHONE_ID, WPP_TOKEN, from, ajustada);
+      return new Response("OK", { status: 200 });
+    }
+
+    // SALVAR
+    await saveMessage(from, "user", text);
+    await saveMessage(from, "assistant", finalText);
+
+    // RODAR ANÁLISE JURÍDICA — ASSÍNCRONA
+    (async () => {
+      try {
+        const fullHistory = await getHistory(from);
+        const analysis = await runLegalAnalysis(OPENAI_KEY, from, fullHistory);
+        if (analysis) await upsertLeadFromAnalysis(from, analysis);
+      } catch (err) {
+        console.error("Erro no pipeline jurídico:", err);
+      }
+    })();
+
+    // ENVIAR RESPOSTA
+    await sendWpp(WPP_PHONE_ID, WPP_TOKEN, from, finalText);
+  } catch (err) {
+    console.error("Erro:", err);
+  }
+
+  return new Response("OK", { status: 200 });
+}
+
+// =======================
+// FUNÇÃO GPT
+// =======================
+async function callOpenAIChat(key, messages) {
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages,
+        max_tokens: 500,
+        temperature: 0.3,
+      }),
+    });
+
+    const data = await res.json();
+    console.log("Resposta OpenAI:", JSON.stringify(data, null, 2));
+
+    return data?.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    console.error("Erro GPT:", e);
+    return null;
   }
 }
 
-// --- FUNÇÃO AUXILIAR: Enviar mensagem para API do WhatsApp ---
-async function sendWhatsAppMessage(to, text) {
-  const version = 'v20.0'; // Ou v21.0, verifique na sua dashboard
-  const phoneNumberId = process.env.WHATSAPP_PHONE_ID;
-  const accessToken = process.env.WHATSAPP_API_TOKEN;
+// =======================
+// FUNÇÃO WHATSAPP
+// =======================
+async function sendWpp(phoneId, token, to, text) {
+  const url = `https://graph.facebook.com/v21.0/${phoneId}/messages`;
 
-  const url = `https://graph.facebook.com/${version}/${phoneNumberId}/messages`;
-
-  const data = {
-    messaging_product: "whatsapp",
-    recipient_type: "individual",
-    to: to,
-    type: "text",
-    text: { body: text }
-  };
-
-  const response = await fetch(url, {
-    method: 'POST',
+  const r = await fetch(url, {
+    method: "POST",
     headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json'
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify(data)
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text },
+    }),
   });
 
-  if (!response.ok) {
-    const errorData = await response.json();
-    console.error("Erro ao enviar mensagem no WhatsApp:", JSON.stringify(errorData, null, 2));
-  }
+  const data = await r.json();
+  console.log("WPP resposta:", r.status, JSON.stringify(data));
+
+  return data;
 }
