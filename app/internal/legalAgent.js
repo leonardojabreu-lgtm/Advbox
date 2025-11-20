@@ -1,64 +1,89 @@
-export async function runLegalAnalysis(openaiKey, phone, history) {
+export async function runLegalAnalysis(geminiKey, phone, history) {
   try {
-    const messages = [
-      {
-        role: "system",
-        content: `
-Você é um AGENTE JURÍDICO. Sua função é ler todo o histórico de mensagens entre o cliente e a secretária Carolina e ORGANIZAR as informações objetivas abaixo.
+    const url =
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=" +
+      geminiKey;
+
+    const systemPrompt = `
+Você é um AGENTE JURÍDICO.
+Sua função é ler todo o histórico de mensagens entre o cliente e a secretária CAROLINA
+e extrair, de forma bem objetiva, os dados principais do caso para o advogado.
 
 IMPORTANTE:
 - NÃO invente dados.
 - Se algum dado não estiver claro, deixe como null.
-- NÃO escreva mensagens longas.
-- SUA RESPOSTA DEVE SER EM JSON PURO.
+- NÃO escreva textos longos.
+- SUA RESPOSTA DEVE SER EM JSON PURO, sem nenhum texto antes ou depois.
 
 ESTRUTURA DO JSON FINAL:
 
 {
- "nome": "...",
- "bairro": "...",
- "cidade": "...",
- "tipo_problema": "...",
- "empresa": "...",
- "dias_sem_servico": "...",
- "conta_em_dia": "...",
- "protocolos": ["...", "..."],
- "prejuizos": "...",
- "resumo_inicial": "TEXTO PRONTO PARA A INICIAL"
+  "nome": "...",
+  "bairro": "...",
+  "cidade": "...",
+  "tipo_problema": "...",   // "água", "luz", "internet", "telefone", "banco", "outro"
+  "empresa": "...",
+  "dias_sem_servico": "...",
+  "conta_em_dia": true,
+  "protocolos": ["...", "..."],
+  "prejuizos": "...",
+  "resumo_inicial": "TEXTO PRONTO PARA A INICIAL"
 }
+`;
 
-Agora leia o histórico e extraia essas informações.
-        `
-      },
-      ...history.map(h => ({
-        role: h.role === "assistant" ? "assistant" : "user",
-        content: h.content
-      }))
-    ];
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${openaiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages,
-        temperature: 0.2,
-        max_tokens: 900
+    const conversa = history
+      .map((m) => {
+        const quem = m.role === "assistant" ? "CAROLINA" : "CLIENTE";
+        return `${quem}: ${m.content}`;
       })
+      .join("\n");
+
+    const userPrompt = `
+${systemPrompt}
+
+Abaixo está o histórico completo de mensagens entre CAROLINA e o CLIENTE (${phone}).
+
+HISTÓRICO:
+${conversa}
+
+Agora, responda APENAS com um JSON válido seguindo exatamente a estrutura pedida.
+`;
+
+    const body = {
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: userPrompt }],
+        },
+      ],
+    };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
 
     const data = await response.json();
-    const jsonText = data?.choices?.[0]?.message?.content;
+    console.log("Resposta do Gemini (agente jurídico):", JSON.stringify(data, null, 2));
 
-    if (!jsonText) return null;
+    const text =
+      data?.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text || "")
+        .join("") || "";
 
-    return JSON.parse(jsonText);
+    if (!text) return null;
 
+    // tenta converter o texto em JSON
+    try {
+      const json = JSON.parse(text);
+      return json;
+    } catch (e) {
+      console.error("Falha ao fazer JSON.parse da resposta do Gemini:", text);
+      return null;
+    }
   } catch (err) {
-    console.error("Erro no agente jurídico:", err);
+    console.error("Erro em runLegalAnalysis:", err);
     return null;
   }
 }
