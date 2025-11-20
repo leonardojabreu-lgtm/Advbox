@@ -1,6 +1,6 @@
 import { supabase } from "./supabaseClient";
 
-export async function getHistory(userId: string) {
+export async function getHistory(userId) {
   try {
     const { data, error } = await supabase
       .from("whatsapp_history")
@@ -15,12 +15,12 @@ export async function getHistory(userId: string) {
 
     return data || [];
   } catch (err) {
-    console.error("Erro inesperado:", err);
+    console.error("Erro inesperado ao buscar histórico:", err);
     return [];
   }
 }
 
-export async function saveMessage(userId: string, role: "user" | "assistant", content: string) {
+export async function saveMessage(userId, role, content) {
   try {
     const { error } = await supabase.from("whatsapp_history").insert({
       user_id: userId,
@@ -32,6 +32,6 @@ export async function saveMessage(userId: string, role: "user" | "assistant", co
       console.error("Erro ao salvar mensagem:", error);
     }
   } catch (err) {
-    console.error("Erro inesperado:", err);
+    console.error("Erro inesperado ao salvar mensagem:", err);
   }
 }
