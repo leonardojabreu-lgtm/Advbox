@@ -128,7 +128,7 @@ MEMÓRIA E CONTEXTO
 - Use esse histórico para:
   - Não repetir a mesma pergunta.
   - Retomar pontos importantes com naturalidade.
-  - Manter a coerência da conversa.
+  - Mantener coerência da conversa.
 - Se já tiver nome, não pergunte de novo.
 - Se já tiver protocolos, não peça de novo, a menos que esteja confuso.
 
@@ -185,14 +185,12 @@ export async function POST(req) {
     const value = change?.value;
     const messages = value?.messages;
 
-    // Nada para processar
     if (!messages || messages.length === 0) {
       return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
     const message = messages[0];
 
-    // Por enquanto só tratamos texto
     if (message.type !== "text") {
       console.log("Mensagem não é de texto, ignorando.");
       return new Response("EVENT_RECEIVED", { status: 200 });
@@ -203,15 +201,15 @@ export async function POST(req) {
 
     const wppToken = process.env.WPP_TOKEN;
     const phoneNumberId = process.env.WPP_PHONE_ID;
-    const openaiKey = process.env.OPENAI_API_KEY;
+    const geminiKey = process.env.GEMINI_API_KEY;
 
     if (!wppToken || !phoneNumberId) {
       console.error("Faltando WPP_TOKEN ou WPP_PHONE_ID nas variáveis de ambiente");
       return new Response("Missing WhatsApp env vars", { status: 500 });
     }
 
-    if (!openaiKey) {
-      console.error("Faltando OPENAI_API_KEY nas variáveis de ambiente");
+    if (!geminiKey) {
+      console.error("Faltando GEMINI_API_KEY nas variáveis de ambiente");
       await enviarMensagemWhatsApp(
         phoneNumberId,
         wppToken,
@@ -224,7 +222,6 @@ export async function POST(req) {
     // 3.1) BUSCA HISTÓRICO NO SUPABASE
     const history = await getHistory(from); // [{role, content, created_at}, ...]
 
-    // Limite de segurança: se já tem muita interação, encerra e manda pro advogado
     if (history.length >= 30) {
       const encerramento =
         "Perfeito, já tenho bastante informação sobre o seu caso aqui.\n" +
@@ -247,14 +244,14 @@ export async function POST(req) {
         content: m.content,
       }));
 
-    const messagesForGPT = [
+    const messagesForLLM = [
       { role: "system", content: systemPrompt },
       ...mensagensPassadas,
       { role: "user", content: `Mensagem do cliente (${from}): ${userText}` },
     ];
 
-    // 3.3) CHAMA GPT-4o (CAROLINA)
-    const respostaCarolina = await callOpenAIChat(openaiKey, messagesForGPT);
+    // 3.3) CHAMA GEMINI (CAROLINA)
+    const respostaCarolina = await callGeminiChat(geminiKey, messagesForLLM);
     const finalText =
       respostaCarolina ||
       "Recebi sua mensagem e já vou analisar com calma. Caso seja algo urgente, me conta se há prazo ou audiência próxima.";
@@ -269,22 +266,21 @@ export async function POST(req) {
       await saveMessage(from, "user", userText);
       await saveMessage(from, "assistant", ajustada);
 
-      // Delay inteligente antes de responder
       await delayInteligente(userText, from);
       await enviarMensagemWhatsApp(phoneNumberId, wppToken, from, ajustada);
 
       return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
-    // 3.5) SALVA HISTÓRICO (usuario + assistente)
+    // 3.5) SALVA HISTÓRICO
     await saveMessage(from, "user", userText);
     await saveMessage(from, "assistant", finalText);
 
-    // 3.6) DISPARA ANÁLISE JURÍDICA + CRM (ASSÍNCRONO)
+    // 3.6) ANÁLISE JURÍDICA + CRM (ASSÍNCRONO)
     (async () => {
       try {
         const fullHistory = await getHistory(from);
-        const analysis = await runLegalAnalysis(openaiKey, from, fullHistory);
+        const analysis = await runLegalAnalysis(geminiKey, from, fullHistory); // se dentro usar OpenAI, aí ajusta depois
         if (analysis) {
           await upsertLeadFromAnalysis(from, analysis);
         }
@@ -293,7 +289,7 @@ export async function POST(req) {
       }
     })();
 
-    // 3.7) DELAY INTELIGENTE + RESPOSTA PELO WHATSAPP
+    // 3.7) DELAY INTELIGENTE + RESPOSTA
     await delayInteligente(userText, from);
     await enviarMensagemWhatsApp(phoneNumberId, wppToken, from, finalText);
   } catch (err) {
@@ -304,30 +300,59 @@ export async function POST(req) {
 }
 
 // =============================
-// 4) CHAMADA AO GPT-4o
+// 4) CHAMADA AO GEMINI
 // =============================
-async function callOpenAIChat(openaiKey, messages) {
+async function callGeminiChat(geminiKey, messages) {
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    // Separa systemInstruction do resto
+    const systemMsg = messages.find((m) => m.role === "system");
+    const systemText = systemMsg?.content || "";
+
+    const contents = messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content }],
+      }));
+
+    const url =
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" +
+      encodeURIComponent(geminiKey);
+
+    const response = await fetch(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${openaiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "gpt-4o",
-        messages,
-        max_tokens: 500,
-        temperature: 0.4,
+        systemInstruction: systemText
+          ? {
+              role: "user",
+              parts: [{ text: systemText }],
+            }
+          : undefined,
+        contents,
+        generationConfig: {
+          temperature: 0.4,
+          maxOutputTokens: 500,
+        },
       }),
     });
 
     const data = await response.json();
-    console.log("Resposta da OpenAI (Carolina):", JSON.stringify(data, null, 2));
+    console.log("Resposta do Gemini (Carolina):", JSON.stringify(data, null, 2));
 
-    return data?.choices?.[0]?.message?.content || null;
+    const candidate = data?.candidates?.[0];
+    const parts = candidate?.content?.parts || [];
+    const text = parts
+      .map((p) => p.text)
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+
+    return text || null;
   } catch (err) {
-    console.error("Erro ao chamar OpenAI:", err);
+    console.error("Erro ao chamar Gemini:", err);
     return null;
   }
 }
@@ -341,11 +366,11 @@ async function delayInteligente(userText, from) {
     let delay = 60000; // padrão: 60s
 
     if (texto.length < 8) {
-      delay = 6000; // 6s para saudações curtas
+      delay = 6000; // 6s para "oi", "boa noite", etc.
     } else if (texto.length < 300) {
       delay = 60000; // 1 min para mensagens normais
     } else {
-      delay = 90000; // 1min30 para textão
+      delay = 90000; // 1min30 para textão grande
     }
 
     console.log(`Delay inteligente para ${from}: ${delay / 1000}s`);
