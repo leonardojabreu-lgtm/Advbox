@@ -65,7 +65,7 @@ export async function POST(req) {
     const userText = message.text?.body || "";
 
     // ====== Chamada ao Gemini ======
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     const prompt =
       "Você é uma secretária virtual de um escritório de advocacia. " +
