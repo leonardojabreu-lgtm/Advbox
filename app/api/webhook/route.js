@@ -1,9 +1,9 @@
+// app/api/webhook/route.js
 import { getHistory, saveMessage } from "../../internal/memory";
 import { buildSystemPrompt } from "../../internal/rules";
 import { runLegalAnalysis } from "../../internal/legalAgent";
-import { upsertLeadFromAnalysis } from "../../internal/crmConnector";
 
-const VERIFY_TOKEN = "leonardo123"; // mesmo token configurado na Meta
+const VERIFY_TOKEN = "leonardo123"; // mesmo usado na Meta
 
 // ========== 1) VERIFICAÇÃO DO WEBHOOK (GET) ==========
 export async function GET(req) {
@@ -41,8 +41,8 @@ export async function POST(req) {
       return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
-    const from = message.from;
-    const userText = message.text?.body || "";
+    const from = message.from;                 // número do cliente
+    const userText = message.text?.body || ""; // texto enviado
 
     const wppToken = process.env.WPP_TOKEN;
     const phoneNumberId = process.env.WPP_PHONE_ID;
@@ -64,19 +64,33 @@ export async function POST(req) {
       return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
-    // ========== 2.1) HISTÓRICO ==========
-    const history = await getHistory(from);
+    // 2.1) Busca histórico no Supabase
+    const history = await getHistory(from); // [{role, content, created_at}]
 
-    if (history.length >= 30) {
+    // Segurança: se já está MUITO longo, encerra e manda para o advogado
+    if (history.length >= 40) {
       const encerramento =
         "Perfeito, já tenho bastante informação sobre o seu caso aqui.\n" +
-        "Agora vou repassar tudo para o advogado responsável analisar com calma. Já já te retorno aqui!";
+        "Agora vou repassar tudo para o advogado responsável do escritório analisar com calma, " +
+        "e assim que ele verificar, alguém da equipe te responde aqui com a orientação certinha, tudo bem?";
+
       await saveMessage(from, "assistant", encerramento);
       await enviarMensagemWhatsApp(phoneNumberId, wppToken, from, encerramento);
+
+      // dispara análise jurídica em background
+      ;(async () => {
+        try {
+          const fullHistory = await getHistory(from);
+          await runLegalAnalysis(openaiKey, from, fullHistory);
+        } catch (err) {
+          console.error("Erro na análise jurídica background:", err);
+        }
+      })();
+
       return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
-    // ========== 2.2) SISTEMA ==========
+    // 2.2) Monta contexto para Carolina
     const systemPrompt = buildSystemPrompt();
 
     const mensagensPassadas = history
@@ -86,48 +100,47 @@ export async function POST(req) {
         content: m.content,
       }));
 
-    const messagesForGPT = [
+    const mensagensParaGPT = [
       { role: "system", content: systemPrompt },
       ...mensagensPassadas,
       { role: "user", content: `Mensagem do cliente (${from}): ${userText}` },
     ];
 
-    // ========== 2.3) CHAMADA GPT ==========
-    const respostaCarolina = await callOpenAIChat(openaiKey, messagesForGPT);
+    // 2.3) Chama GPT-4o mini
+    const respostaCarolina = await callOpenAIChat(openaiKey, mensagensParaGPT);
     const finalText =
       respostaCarolina ||
-      "Recebi sua mensagem e já vou analisar com calma. Caso seja algo urgente, me avise ♥️";
+      "Recebi sua mensagem e já vou analisar com calma. Caso seja algo urgente, me conta se há prazo ou audiência próxima.";
 
-    // ========== 2.4) BLOQUEIO DUPLICAÇÃO ==========
+    // 2.4) Bloqueio de resposta duplicada
     const ultimaResposta = history.filter((h) => h.role === "assistant").at(-1);
-
     if (ultimaResposta && ultimaResposta.content?.trim() === finalText.trim()) {
+      console.log("Resposta igual à anterior, ajustando texto.");
       const ajustada =
-        finalText + "\n\n(Só ajustei aqui para não repetir a mesma mensagem 😊)";
+        finalText +
+        "\n\n(Atualizei aqui pra não te mandar a mesma mensagem duas vezes seguidas 😊)";
       await saveMessage(from, "user", userText);
       await saveMessage(from, "assistant", ajustada);
       await enviarMensagemWhatsApp(phoneNumberId, wppToken, from, ajustada);
       return new Response("EVENT_RECEIVED", { status: 200 });
     }
 
-    // ========== 2.5) SALVA HISTÓRICO ==========
+    // 2.5) Salva histórico
     await saveMessage(from, "user", userText);
     await saveMessage(from, "assistant", finalText);
 
-    // ========== 2.6) PIPELINE ASSÍNCRONO ==========
-    (async () => {
+    // 2.6) Dispara análise jurídica + CRM em background (se quiser)
+    ;(async () => {
       try {
         const fullHistory = await getHistory(from);
-        const analysis = await runLegalAnalysis(openaiKey, from, fullHistory);
-        if (analysis) {
-          await upsertLeadFromAnalysis(from, analysis);
-        }
+        await runLegalAnalysis(openaiKey, from, fullHistory);
+        // aqui depois podemos chamar upsertLeadFromAnalysis(...)
       } catch (err) {
         console.error("Erro no pipeline jurídico/CRM:", err);
       }
     })();
 
-    // ========== 2.7) RESPONDE ==========
+    // 2.7) Responde pelo WhatsApp
     await enviarMensagemWhatsApp(phoneNumberId, wppToken, from, finalText);
   } catch (err) {
     console.error("Erro ao processar webhook:", err);
@@ -136,10 +149,10 @@ export async function POST(req) {
   return new Response("EVENT_RECEIVED", { status: 200 });
 }
 
-// ========== 3) CHAMADA GPT ==========
+// ========== 3) Chamada genérica ao GPT-4o mini ==========
 async function callOpenAIChat(openaiKey, messages) {
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiKey}`,
@@ -153,8 +166,8 @@ async function callOpenAIChat(openaiKey, messages) {
       }),
     });
 
-    const data = await response.json();
-    console.log("Resposta da OpenAI:", JSON.stringify(data, null, 2));
+    const data = await resp.json();
+    console.log("Resposta da OpenAI (Carolina):", JSON.stringify(data, null, 2));
 
     return data?.choices?.[0]?.message?.content || null;
   } catch (err) {
@@ -163,7 +176,7 @@ async function callOpenAIChat(openaiKey, messages) {
   }
 }
 
-// ========== 4) ENVIAR MENSAGEM ==========
+// ========== 4) Enviar mensagem pelo WhatsApp ==========
 async function enviarMensagemWhatsApp(phoneNumberId, token, to, text) {
   const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
 
@@ -182,9 +195,9 @@ async function enviarMensagemWhatsApp(phoneNumberId, token, to, text) {
   });
 
   const data = await resp.json();
-  console.log("Resposta WhatsApp:", resp.status, JSON.stringify(data, null, 2));
+  console.log("Resposta da API do WhatsApp:", resp.status, JSON.stringify(data, null, 2));
 
   if (!resp.ok) {
-    console.error("Erro ao enviar mensagem:", data);
+    console.error("Erro ao enviar mensagem pelo WhatsApp:", data);
   }
 }
