@@ -1,37 +1,14 @@
-import { supabase } from "./supabaseClient";
+// app/internal/supabaseClient.js
+import { createClient } from "@supabase/supabase-js";
 
-export async function getHistory(userId) {
-  try {
-    const { data, error } = await supabase
-      .from("whatsapp_history")
-      .select("*")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: true });
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 
-    if (error) {
-      console.error("Erro ao buscar histórico:", error);
-      return [];
-    }
-
-    return data || [];
-  } catch (err) {
-    console.error("Erro inesperado ao buscar histórico:", err);
-    return [];
-  }
+if (!supabaseUrl || !supabaseAnonKey) {
+  console.error("Faltando SUPABASE_URL ou SUPABASE_ANON_KEY nas variáveis de ambiente");
 }
 
-export async function saveMessage(userId, role, content) {
-  try {
-    const { error } = await supabase.from("whatsapp_history").insert({
-      user_id: userId,
-      role,
-      content,
-    });
-
-    if (error) {
-      console.error("Erro ao salvar mensagem:", error);
-    }
-  } catch (err) {
-    console.error("Erro inesperado ao salvar mensagem:", err);
-  }
-}
+export const supabase =
+  supabaseUrl && supabaseAnonKey
+    ? createClient(supabaseUrl, supabaseAnonKey)
+    : null;
